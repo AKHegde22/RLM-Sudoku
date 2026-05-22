@@ -11,12 +11,12 @@ import os
 torch.manual_seed(42)
 np.random.seed(42)
 
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
+    torch.set_float32_matmul_precision("high")
 elif torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 else:
     DEVICE = torch.device("cpu")
 
@@ -107,7 +107,7 @@ class SudokuPositionalEncoding(nn.Module):
 
 
 class TinyRecursiveSudoku(nn.Module):
-    def __init__(self, vocab_size=10, embed_dim=192, num_layers=3):
+    def __init__(self, vocab_size=10, embed_dim=768, num_layers=8):
         super().__init__()
         self.embed_dim = embed_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -115,7 +115,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.input_proj = nn.Linear(embed_dim * 3, embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
-            nhead=6,
+            nhead=12,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
             activation="gelu"
@@ -124,7 +124,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.output_head = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x, steps=8, noise_scale=0.0):
+    def forward(self, x, steps=12, noise_scale=0.0):
         batch_size, seq_len = x.shape
         pos = self.pos_encoding(batch_size, x.device)
         x_emb = self.embedding(x) + pos
@@ -151,16 +151,17 @@ def compute_mode(tensor, dim=1):
     return counts.argmax(dim=-1), None
 
 
-EPOCHS = 30
-RECURSIVE_STEPS = 8
+EPOCHS = 50
+RECURSIVE_STEPS = 12
 CURRICULUM_START = 20
-CURRICULUM_END = 50
-BATCH_SIZE = 128
-TRAIN_SAMPLES = 10000
+CURRICULUM_END = 55
+BATCH_SIZE = 512
+TRAIN_SAMPLES = 100000
+NUM_WORKERS = 4
 
 val_x, val_y = create_dataset(2000, empty_cells=45)
 val_dataset = torch.utils.data.TensorDataset(val_x, val_y)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
 train_losses, val_losses = [], []
 lr_hist = []
@@ -172,24 +173,46 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 )
 criterion = nn.CrossEntropyLoss()
 
-for epoch in range(EPOCHS):
+use_amp = DEVICE.type == "cuda"
+scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=use_amp)
+
+start_epoch = 0
+checkpoint_path = "trm_checkpoint.pt"
+if os.path.exists(checkpoint_path):
+    print(f"Resuming from checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    start_epoch = ckpt["epoch"]
+    train_losses = ckpt["train_losses"]
+    val_losses = ckpt["val_losses"]
+    lr_hist = ckpt["lr_hist"]
+    print(f"Resumed at epoch {start_epoch}/{EPOCHS}")
+
+print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+
+for epoch in range(start_epoch, EPOCHS):
     curriculum_empty = int(CURRICULUM_START + (CURRICULUM_END - CURRICULUM_START) * (epoch / (EPOCHS - 1)))
     train_x, train_y = create_dataset(TRAIN_SAMPLES, empty_cells=curriculum_empty)
     train_dataset = torch.utils.data.TensorDataset(train_x, train_y)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
 
     model.train()
     epoch_loss = 0
     for x_batch, y_batch in train_loader:
         x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
         optimizer.zero_grad()
-        step_outputs = model(x_batch, steps=RECURSIVE_STEPS)
-        loss = 0
-        for logits in step_outputs:
-            loss += criterion(logits.view(-1, 10), y_batch.view(-1))
-        loss.backward()
+        with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
+            step_outputs = model(x_batch, steps=RECURSIVE_STEPS)
+            loss = 0
+            for logits in step_outputs:
+                loss += criterion(logits.view(-1, 10), y_batch.view(-1))
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         epoch_loss += loss.item()
 
     avg_train_loss = epoch_loss / len(train_loader)
@@ -200,9 +223,10 @@ for epoch in range(EPOCHS):
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
             x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
-            outputs = model(x_batch, steps=RECURSIVE_STEPS)
-            final_logits = outputs[-1]
-            val_loss += criterion(final_logits.view(-1, 10), y_batch.view(-1)).item()
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
+                outputs = model(x_batch, steps=RECURSIVE_STEPS)
+                final_logits = outputs[-1]
+                val_loss += criterion(final_logits.view(-1, 10), y_batch.view(-1)).item()
 
     avg_val_loss = val_loss / len(val_loader)
     val_losses.append(avg_val_loss)
@@ -213,6 +237,16 @@ for epoch in range(EPOCHS):
 
     print(f"Epoch {epoch+1}/{EPOCHS} | Empty: {curriculum_empty} | "
           f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr:.2e}")
+
+    torch.save({
+        "epoch": epoch + 1,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "lr_hist": lr_hist,
+    }, checkpoint_path)
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -290,3 +324,7 @@ model_path = "trm_sudoku_model.pth"
 torch.save(model.state_dict(), model_path)
 print(f"Model successfully saved to: {os.path.abspath(model_path)}")
 print("Files generated: trm_training_curve.png, evaluation_metrics.json, trm_sudoku_model.pth")
+
+if os.path.exists(checkpoint_path):
+    os.remove(checkpoint_path)
+    print("Checkpoint cleaned up.")
