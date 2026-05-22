@@ -11,6 +11,8 @@ import os
 torch.manual_seed(42)
 np.random.seed(42)
 
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -19,6 +21,7 @@ else:
     DEVICE = torch.device("cpu")
 
 print(f"Using device: {DEVICE}")
+
 
 def generate_base_board():
     return np.array([
@@ -32,6 +35,7 @@ def generate_base_board():
         [2, 8, 7, 4, 1, 9, 6, 3, 5],
         [3, 4, 5, 2, 8, 6, 1, 7, 9]
     ])
+
 
 def shuffle_board(board):
     b = board.copy()
@@ -54,10 +58,11 @@ def shuffle_board(board):
     b = np.rot90(b, k=np.random.randint(0, 4))
     return b
 
+
 def create_dataset(num_samples=10000, empty_cells=40):
     base = generate_base_board()
     X, Y = [], []
-    print(f"Generating {num_samples} unique Sudoku boards...")
+    print(f"Generating {num_samples} unique Sudoku boards with {empty_cells} empty cells...")
     for _ in tqdm(range(num_samples)):
         solved = shuffle_board(base)
         puzzle = solved.copy()
@@ -67,47 +72,63 @@ def create_dataset(num_samples=10000, empty_cells=40):
         Y.append(solved.flatten())
     return torch.tensor(np.array(X), dtype=torch.long), torch.tensor(np.array(Y), dtype=torch.long)
 
-train_x, train_y = create_dataset(20000, empty_cells=45)
-val_x, val_y = create_dataset(2000, empty_cells=45)
 
-class SudokuDataset(Dataset):
-    def __init__(self, x_tensor, y_tensor):
-        self.x = x_tensor
-        self.y = y_tensor
+class SudokuPositionalEncoding(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.embed_dim = embed_dim
+        quarter_dim = embed_dim // 4
 
-    def __len__(self):
-        return len(self.x)
+        self.row_embed = nn.Embedding(9, quarter_dim)
+        self.col_embed = nn.Embedding(9, quarter_dim)
+        self.box_embed = nn.Embedding(9, quarter_dim)
 
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
+        remaining = embed_dim - quarter_dim * 3
+        pos = torch.arange(81).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, remaining, 2) * -(np.log(10000.0) / remaining))
+        pe = torch.zeros(1, 81, remaining)
+        pe[0, :, 0::2] = torch.sin(pos * div_term)
+        pe[0, :, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer("sin_pe", pe)
 
-BATCH_SIZE = 128
-train_loader = DataLoader(SudokuDataset(train_x, train_y), batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(SudokuDataset(val_x, val_y), batch_size=BATCH_SIZE, shuffle=False)
+        rows = torch.arange(9).view(9, 1).expand(9, 9).flatten()
+        cols = torch.arange(9).view(1, 9).expand(9, 9).flatten()
+        boxes = (rows // 3) * 3 + (cols // 3)
+        self.register_buffer("row_ids", rows)
+        self.register_buffer("col_ids", cols)
+        self.register_buffer("box_ids", boxes)
 
-print(f"Training batches: {len(train_loader)}")
-print(f"Validation batches: {len(val_loader)}")
+    def forward(self, batch_size, device):
+        row = self.row_embed(self.row_ids.to(device)).unsqueeze(0).expand(batch_size, -1, -1)
+        col = self.col_embed(self.col_ids.to(device)).unsqueeze(0).expand(batch_size, -1, -1)
+        box = self.box_embed(self.box_ids.to(device)).unsqueeze(0).expand(batch_size, -1, -1)
+        sin = self.sin_pe.to(device).expand(batch_size, -1, -1)
+        return torch.cat([row, col, box, sin], dim=-1)
+
 
 class TinyRecursiveSudoku(nn.Module):
-    def __init__(self, vocab_size=10, embed_dim=128, num_layers=2):
+    def __init__(self, vocab_size=10, embed_dim=256, num_layers=4):
         super().__init__()
         self.embed_dim = embed_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.pos_encoding = SudokuPositionalEncoding(embed_dim)
         self.input_proj = nn.Linear(embed_dim * 3, embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
-            nhead=4,
+            nhead=8,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
             activation="gelu"
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.layer_norm = nn.LayerNorm(embed_dim)
         self.output_head = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x, steps=6, noise_scale=0.0):
+    def forward(self, x, steps=10, noise_scale=0.0):
         batch_size, seq_len = x.shape
-        x_emb = self.embedding(x)
-        y_emb = self.embedding(x)
+        pos = self.pos_encoding(batch_size, x.device)
+        x_emb = self.embedding(x) + pos
+        y_emb = self.embedding(x) + pos
         z = torch.zeros(batch_size, seq_len, self.embed_dim, device=x.device)
         step_predictions = []
         for _ in range(steps):
@@ -116,22 +137,46 @@ class TinyRecursiveSudoku(nn.Module):
             combined = torch.cat([x_emb, y_emb, z], dim=-1)
             z_in = F.gelu(self.input_proj(combined))
             z = self.transformer(z_in)
+            z = self.layer_norm(z)
             logits = self.output_head(z)
             step_predictions.append(logits)
             probs = F.softmax(logits, dim=-1)
-            y_emb = torch.matmul(probs, self.embedding.weight)
+            y_emb = torch.matmul(probs, self.embedding.weight) + pos
         return step_predictions
+
+
+def compute_mode(tensor, dim=1):
+    one_hot = F.one_hot(tensor, num_classes=10)
+    counts = one_hot.sum(dim=dim)
+    return counts.argmax(dim=-1), None
+
+
+EPOCHS = 40
+RECURSIVE_STEPS = 10
+CURRICULUM_START = 20
+CURRICULUM_END = 55
+BATCH_SIZE = 128
+
+val_x, val_y = create_dataset(2000, empty_cells=45)
+val_dataset = torch.utils.data.TensorDataset(val_x, val_y)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+train_losses, val_losses = [], []
+lr_hist = []
 
 model = TinyRecursiveSudoku().to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
+)
 criterion = nn.CrossEntropyLoss()
 
-EPOCHS = 15
-RECURSIVE_STEPS = 6
-train_losses, val_losses = [], []
-
-print("Starting Deep Supervision Training...")
 for epoch in range(EPOCHS):
+    curriculum_empty = int(CURRICULUM_START + (CURRICULUM_END - CURRICULUM_START) * (epoch / (EPOCHS - 1)))
+    train_x, train_y = create_dataset(20000, empty_cells=curriculum_empty)
+    train_dataset = torch.utils.data.TensorDataset(train_x, train_y)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
     model.train()
     epoch_loss = 0
     for x_batch, y_batch in train_loader:
@@ -160,20 +205,44 @@ for epoch in range(EPOCHS):
 
     avg_val_loss = val_loss / len(val_loader)
     val_losses.append(avg_val_loss)
-    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss (Summed): {avg_train_loss:.4f} | Val Loss (Final Step): {avg_val_loss:.4f}")
 
-plt.figure(figsize=(10, 5))
-plt.plot(train_losses, label='Train Loss (All Steps)')
-plt.plot(val_losses, label='Val Loss (Final Step)')
-plt.title('TRM Training Curve (Deep Supervision)')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.grid(True)
-plt.savefig('trm_training_curve.png')
+    scheduler.step(avg_val_loss)
+    current_lr = optimizer.param_groups[0]["lr"]
+    lr_hist.append(current_lr)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | Empty: {curriculum_empty} | "
+          f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr:.2e}")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].plot(train_losses, label="Train Loss (All Steps)")
+axes[0].plot(val_losses, label="Val Loss (Final Step)")
+axes[0].set_title("TRM Training Curve (Deep Supervision)")
+axes[0].set_xlabel("Epoch")
+axes[0].set_ylabel("Loss")
+axes[0].legend()
+axes[0].grid(True)
+
+ax2 = axes[0].twinx()
+ax2.plot(lr_hist, "g--", alpha=0.5, label="Learning Rate")
+ax2.set_ylabel("LR", color="g")
+ax2.tick_params(axis="y", labelcolor="g")
+
+axes[1].plot(train_losses, label="Train Loss (All Steps)")
+axes[1].plot(val_losses, label="Val Loss (Final Step)")
+axes[1].set_title("Loss (Zoomed)")
+axes[1].set_xlabel("Epoch")
+axes[1].set_ylabel("Loss")
+axes[1].legend()
+axes[1].grid(True)
+axes[1].set_ylim(bottom=min(val_losses) - 0.05)
+
+plt.tight_layout()
+plt.savefig("trm_training_curve.png")
 plt.close()
 
-def evaluate_accuracy(model, loader, steps=6, noise=0.0, parallel_votes=1):
+
+def evaluate_accuracy(model, loader, steps=10, noise=0.0, parallel_votes=1):
     model.eval()
     correct_boards = 0
     total_boards = 0
@@ -187,7 +256,7 @@ def evaluate_accuracy(model, loader, steps=6, noise=0.0, parallel_votes=1):
                 final_logits = outputs[-1]
                 preds = torch.argmax(final_logits, dim=-1)
                 preds = preds.view(B, parallel_votes, L)
-                final_preds, _ = torch.mode(preds, dim=1)
+                final_preds, _ = compute_mode(preds, dim=1)
             else:
                 outputs = model(x_batch, steps=steps, noise_scale=noise)
                 final_preds = torch.argmax(outputs[-1], dim=-1)
@@ -196,23 +265,27 @@ def evaluate_accuracy(model, loader, steps=6, noise=0.0, parallel_votes=1):
             total_boards += x_batch.size(0)
     return (correct_boards / total_boards) * 100
 
-print("Running Deterministic TRM Evaluation...")
-trm_acc = evaluate_accuracy(model, val_loader, steps=6, noise=0.0, parallel_votes=1)
+
+print("\nRunning Deterministic TRM Evaluation...")
+trm_acc = evaluate_accuracy(model, val_loader, steps=RECURSIVE_STEPS, noise=0.0, parallel_votes=1)
 print(f"Standard TRM Accuracy (Perfect Boards): {trm_acc:.2f}%\n")
 
 print("Running Stochastic PTRM Evaluation (Injecting latent noise & voting)...")
-ptrm_acc = evaluate_accuracy(model, val_loader, steps=6, noise=0.1, parallel_votes=5)
+ptrm_acc = evaluate_accuracy(model, val_loader, steps=RECURSIVE_STEPS, noise=0.1, parallel_votes=5)
 print(f"PTRM Accuracy (Perfect Boards): {ptrm_acc:.2f}%")
 
 metrics = {
     "trm_accuracy": trm_acc,
     "ptrm_accuracy": ptrm_acc,
-    "epochs_trained": EPOCHS
+    "epochs_trained": EPOCHS,
+    "model_dim": model.embed_dim,
+    "num_layers": model.transformer.num_layers,
+    "recursive_steps": RECURSIVE_STEPS,
 }
-with open('evaluation_metrics.json', 'w') as f:
+with open("evaluation_metrics.json", "w") as f:
     json.dump(metrics, f, indent=4)
 
 model_path = "trm_sudoku_model.pth"
 torch.save(model.state_dict(), model_path)
 print(f"Model successfully saved to: {os.path.abspath(model_path)}")
-print("Files generated in directory: trm_training_curve.png, evaluation_metrics.json, trm_sudoku_model.pth")
+print("Files generated: trm_training_curve.png, evaluation_metrics.json, trm_sudoku_model.pth")
