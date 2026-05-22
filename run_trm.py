@@ -107,7 +107,7 @@ class SudokuPositionalEncoding(nn.Module):
 
 
 class TinyRecursiveSudoku(nn.Module):
-    def __init__(self, vocab_size=10, embed_dim=256, num_layers=4):
+    def __init__(self, vocab_size=10, embed_dim=192, num_layers=3):
         super().__init__()
         self.embed_dim = embed_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -115,7 +115,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.input_proj = nn.Linear(embed_dim * 3, embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
-            nhead=8,
+            nhead=6,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
             activation="gelu"
@@ -124,7 +124,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.output_head = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x, steps=10, noise_scale=0.0):
+    def forward(self, x, steps=8, noise_scale=0.0):
         batch_size, seq_len = x.shape
         pos = self.pos_encoding(batch_size, x.device)
         x_emb = self.embedding(x) + pos
@@ -151,11 +151,12 @@ def compute_mode(tensor, dim=1):
     return counts.argmax(dim=-1), None
 
 
-EPOCHS = 40
-RECURSIVE_STEPS = 10
+EPOCHS = 30
+RECURSIVE_STEPS = 8
 CURRICULUM_START = 20
-CURRICULUM_END = 55
+CURRICULUM_END = 50
 BATCH_SIZE = 128
+TRAIN_SAMPLES = 10000
 
 val_x, val_y = create_dataset(2000, empty_cells=45)
 val_dataset = torch.utils.data.TensorDataset(val_x, val_y)
@@ -173,7 +174,7 @@ criterion = nn.CrossEntropyLoss()
 
 for epoch in range(EPOCHS):
     curriculum_empty = int(CURRICULUM_START + (CURRICULUM_END - CURRICULUM_START) * (epoch / (EPOCHS - 1)))
-    train_x, train_y = create_dataset(20000, empty_cells=curriculum_empty)
+    train_x, train_y = create_dataset(TRAIN_SAMPLES, empty_cells=curriculum_empty)
     train_dataset = torch.utils.data.TensorDataset(train_x, train_y)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
@@ -242,7 +243,7 @@ plt.savefig("trm_training_curve.png")
 plt.close()
 
 
-def evaluate_accuracy(model, loader, steps=10, noise=0.0, parallel_votes=1):
+def evaluate_accuracy(model, loader, steps=RECURSIVE_STEPS, noise=0.0, parallel_votes=1):
     model.eval()
     correct_boards = 0
     total_boards = 0
