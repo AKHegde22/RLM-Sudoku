@@ -93,3 +93,11 @@ pip install torch numpy matplotlib tqdm pygame
 - **Training:** GPU with 8GB+ VRAM recommended. MPS (Apple Silicon) and CPU supported.
 - **Inference:** Runs on any device with PyTorch — no GPU needed for inference.
 - **Tested on:** M2 MacBook Air (16GB), Tesla P100 (16GB)
+
+## Future Improvements
+
+- **Constrained Decoding** — Mask logits at inference to prevent duplicate digits in rows, columns, or boxes. Zero training cost, high accuracy gain.
+- **Constraint-Awareness Loss** — Add a differentiable penalty for constraint violations during training to teach Sudoku rules directly.
+- **Relative Position Bias** — Inject row/col/box adjacency biases into transformer attention for better structural reasoning.
+- **Self-Consistency Voting** — Average predictions across multiple stochastic passes with noise injection for more robust results.
+- **Test-Time Step Scaling** — Increase recursive steps (e.g. 16–24) at inference for more refinement cycles without retraining.
