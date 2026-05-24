@@ -107,7 +107,7 @@ class SudokuPositionalEncoding(nn.Module):
 
 
 class TinyRecursiveSudoku(nn.Module):
-    def __init__(self, vocab_size=10, embed_dim=768, num_layers=8):
+    def __init__(self, vocab_size=10, embed_dim=192, num_layers=3):
         super().__init__()
         self.embed_dim = embed_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -115,7 +115,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.input_proj = nn.Linear(embed_dim * 3, embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
-            nhead=12,
+            nhead=6,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
             activation="gelu"
@@ -124,7 +124,7 @@ class TinyRecursiveSudoku(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.output_head = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x, steps=12, noise_scale=0.0):
+    def forward(self, x, steps=8, noise_scale=0.0):
         batch_size, seq_len = x.shape
         pos = self.pos_encoding(batch_size, x.device)
         x_emb = self.embedding(x) + pos
@@ -151,13 +151,13 @@ def compute_mode(tensor, dim=1):
     return counts.argmax(dim=-1), None
 
 
-EPOCHS = 50
-RECURSIVE_STEPS = 12
+EPOCHS = 60
+RECURSIVE_STEPS = 8
 CURRICULUM_START = 20
-CURRICULUM_END = 55
-BATCH_SIZE = 512
-TRAIN_SAMPLES = 100000
-NUM_WORKERS = 4
+CURRICULUM_END = 50
+BATCH_SIZE = 128
+TRAIN_SAMPLES = 50000
+NUM_WORKERS = 0
 
 val_x, val_y = create_dataset(2000, empty_cells=45)
 val_dataset = torch.utils.data.TensorDataset(val_x, val_y)

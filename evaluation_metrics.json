@@ -1,7 +1,7 @@
 {
-    "trm_accuracy": 24.45,
-    "ptrm_accuracy": 24.55,
-    "epochs_trained": 30,
+    "trm_accuracy": 25.25,
+    "ptrm_accuracy": 25.5,
+    "epochs_trained": 60,
     "model_dim": 192,
     "num_layers": 3,
     "recursive_steps": 8
