@@ -2,6 +2,10 @@
 
 A recursive language model approach for solving Sudoku puzzles using a Transformer with deep supervision and curriculum learning.
 
+<p align="center">
+  <img src="trm_training_curve.png" alt="Training Curve" width="700">
+</p>
+
 ## Architecture
 
 The model (`TinyRecursiveSudoku`) uses a **recursive reasoning loop** inspired by the "Thinking Recursively" (TRM) paradigm:
